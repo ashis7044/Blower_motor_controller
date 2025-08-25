@@ -1,0 +1,169 @@
+/*
+ * Nidec TF029B Blower Control with Clean Data Output
+ * This version outputs clean CSV data for Python logging
+ */
+
+#include <Arduino.h>
+#include <Wire.h>
+
+// --- Pin Definitions ---
+const int DAC_PIN = A0;
+const int FG_PIN = 2;
+const int BRAKE_PIN = 3;
+const int ERROR_PIN = 4;
+
+// --- Constants ---
+const int REVS_PER_PULSE = 10;
+volatile unsigned long fgPulseCount = 0;
+unsigned long lastRpmTime = 0;
+float currentRpm = 0;
+
+// --- Control Variables ---
+int targetRpm = 0;
+float targetCntVoltage = 0.0;
+bool brakeActive = false;
+bool recordingData = false;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  analogWriteResolution(12);
+  pinMode(BRAKE_PIN, OUTPUT);
+  pinMode(ERROR_PIN, INPUT_PULLUP);
+  pinMode(FG_PIN, INPUT_PULLUP);
+
+  digitalWrite(BRAKE_PIN, LOW);
+  analogWrite(DAC_PIN, 0);
+
+  attachInterrupt(digitalPinToInterrupt(FG_PIN), countFgPulse, RISING);
+
+  Serial.println("READY"); // Signal to Python that Arduino is ready
+}
+
+void loop() {
+  checkFatalError();
+  handleSerialCommands();
+  
+  if (millis() - lastRpmTime >= 1000) {
+    sendDataUpdate();
+    lastRpmTime = millis();
+  }
+}
+
+void countFgPulse() {
+  fgPulseCount++;
+}
+
+void sendDataUpdate() {
+  noInterrupts();
+  unsigned long pulses = fgPulseCount;
+  fgPulseCount = 0;
+  interrupts();
+
+  currentRpm = (float)(pulses * REVS_PER_PULSE) * 60.0;
+  bool errorState = (digitalRead(ERROR_PIN) == LOW);
+
+  // Show formatted output like original working version
+  Serial.print(recordingData ? "●LIVE" : "○LIVE");
+  Serial.print(" | RPM: ");
+  Serial.print((int)currentRpm);
+  Serial.print(" | Target: ");
+  Serial.print(targetRpm);
+  Serial.print(" | CNT: ");
+  Serial.print(targetCntVoltage, 2);
+  Serial.print("V | Brake: ");
+  Serial.print(brakeActive ? "ON" : "OFF");
+  Serial.print(" | Status: ");
+  Serial.print(errorState ? "ERROR" : "OK");
+  Serial.print(" | (Type 'start' to record)");
+  Serial.println();
+}
+
+void setSpeedByRpm(int rpm) {
+  targetRpm = constrain(rpm, 0, 50000);
+  if (targetRpm < 10000) {
+    targetCntVoltage = 0.0;
+  } else {
+    targetCntVoltage = map(targetRpm, 10000, 50000, 500, 4500) / 1000.0;
+  }
+  setSpeedByVoltage(targetCntVoltage);
+}
+
+void setSpeedByVoltage(float voltage) {
+  targetCntVoltage = constrain(voltage, 0.0, 4.5);
+  
+  float dacCommandVoltage = targetCntVoltage + 0.10; // DAC calibration
+  dacCommandVoltage = constrain(dacCommandVoltage, 0.0, 5.0);
+  
+  int dacValue = map(dacCommandVoltage * 1000, 0, 5000, 0, 4095);
+  dacValue = constrain(dacValue, 0, 4095);
+  
+  analogWrite(DAC_PIN, dacValue);
+
+  if (targetCntVoltage < 0.5) {
+    targetRpm = 0;
+  } else {
+    targetRpm = map(targetCntVoltage * 100, 50, 450, 10000, 50000);
+  }
+}
+
+void checkFatalError() {
+  if (digitalRead(ERROR_PIN) == LOW) {
+    setSpeedByVoltage(0);
+    digitalWrite(BRAKE_PIN, HIGH);
+    Serial.println("ERROR,FATAL_ERROR_DETECTED");
+    while (1) {
+      delay(1000);
+    }
+  }
+}
+
+void handleSerialCommands() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+
+    if (command.startsWith("s")) {
+      int rpm = command.substring(1).toInt();
+      setSpeedByRpm(rpm);
+      Serial.println("ACK,RPM_SET");
+    } 
+    else if (command.startsWith("v")) {
+      float voltage = command.substring(1).toFloat();
+      setSpeedByVoltage(voltage);
+      Serial.println("ACK,VOLTAGE_SET");
+    }
+    else if (command.equalsIgnoreCase("brake_on")) {
+      brakeActive = true;
+      digitalWrite(BRAKE_PIN, HIGH);
+      Serial.println("ACK,BRAKE_ON");
+    }
+    else if (command.equalsIgnoreCase("brake_off")) {
+      brakeActive = false;
+      digitalWrite(BRAKE_PIN, LOW);
+      Serial.println("ACK,BRAKE_OFF");
+    }
+    else if (command.equalsIgnoreCase("start")) {
+      recordingData = true;
+      Serial.println("Started recording data...");
+    }
+    else if (command.equalsIgnoreCase("stop")) {
+      recordingData = false;
+      setSpeedByVoltage(0);
+      Serial.println("Stopped recording. Goodbye! (No data saved)");
+    }
+    else if (command.equalsIgnoreCase("status")) {
+      Serial.print("STATUS,");
+      Serial.print(targetRpm);
+      Serial.print(",");
+      Serial.print(currentRpm, 0);
+      Serial.print(",");
+      Serial.print(targetCntVoltage, 2);
+      Serial.print(",");
+      Serial.print(brakeActive ? "ON" : "OFF");
+      Serial.print(",");
+      Serial.println(digitalRead(ERROR_PIN) == LOW ? "ERROR" : "OK");
+    }
+  }
+}
