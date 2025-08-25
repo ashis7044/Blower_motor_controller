@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+"""
+Boreasa Blower RPM Logger
+Simple data logger that reads RPM from Arduino and logs to CSV with elapsed time starting from 0ms.
+No speed control - only monitoring actual RPM from the blower.
+"""
+
+import serial
+import serial.tools.list_ports
+import csv
+import datetime
+import time
+import threading
+import sys
+import os
+import re
+
+# Configuration
+BAUD_RATE = 115200
+SERIAL_TIMEOUT = 2.0
+CSV_FILENAME = f"boreasa_rpm_log_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+class BoreasaRPMLogger:
+    def __init__(self, port=None):
+        self.port = port
+        self.serial_conn = None
+        self.running = False
+        self.logging = False
+        self.start_time = None
+        self.csv_file = None
+        self.csv_writer = None
+        
+    def find_arduino_port(self):
+        """Find the Arduino port automatically"""
+        # First try the common ports
+        test_ports = ["COM8", "COM6", "COM3", "COM4", "COM5"]
+        
+        # Then scan for other potential Arduino ports
+        ports = serial.tools.list_ports.comports()
+        for port in ports:
+            if any(keyword in port.description.upper() for keyword in 
+                   ['ARDUINO', 'USB', 'CH340', 'CP210', 'FTDI', 'SERIAL']):
+                if port.device not in test_ports:
+                    test_ports.append(port.device)
+        
+        # Test each port for Arduino-like behavior
+        for test_port in test_ports:
+            if self.test_arduino_connection(test_port):
+                print(f"✓ Found Arduino on {test_port}")
+                return test_port
+        
+        return None
+    
+    def test_arduino_connection(self, port):
+        """Test if a port has an Arduino with expected RPM data"""
+        try:
+            test_conn = serial.Serial(
+                port=port, 
+                baudrate=BAUD_RATE, 
+                timeout=1.0
+            )
+            test_conn.reset_input_buffer()
+            time.sleep(2)  # Wait for Arduino to initialize
+            
+            # Try to read a few lines and look for RPM data
+            for _ in range(5):
+                line = test_conn.readline().decode('utf-8', errors='ignore').strip()
+                if line and 'RPM' in line.upper():
+                    test_conn.close()
+                    return True
+                    
+            test_conn.close()
+            return False
+            
+        except Exception:
+            return False
+    
+    def setup_csv(self):
+        """Setup CSV file with headers"""
+        try:
+            self.csv_file = open(CSV_FILENAME, 'w', newline='', encoding='utf-8')
+            self.csv_writer = csv.writer(self.csv_file)
+            
+            # Write CSV headers
+            headers = ['Elapsed_Time_ms', 'RPM']
+            self.csv_writer.writerow(headers)
+            self.csv_file.flush()
+            
+            print(f"✓ CSV file created: {CSV_FILENAME}")
+            return True
+        except Exception as e:
+            print(f"✗ Error creating CSV file: {e}")
+            return False
+    
+    def close_csv(self):
+        """Close CSV file safely"""
+        if self.csv_file:
+            try:
+                self.csv_file.close()
+                print(f"✓ Data saved to: {CSV_FILENAME}")
+            except Exception as e:
+                print(f"✗ Error closing CSV file: {e}")
+    
+    def log_data(self, elapsed_time_ms, rpm):
+        """Log data to CSV file"""
+        if self.csv_writer and self.logging:
+            try:
+                self.csv_writer.writerow([elapsed_time_ms, rpm])
+                self.csv_file.flush()  # Ensure data is written immediately
+            except Exception as e:
+                print(f"✗ Error writing to CSV: {e}")
+    
+    def parse_rpm_from_line(self, line):
+        """Extract RPM value from Arduino serial line"""
+        # Look for patterns like "Actual Speed: 1234.5 RPM"
+        rpm_match = re.search(r'Actual Speed:\s*([0-9]+\.?[0-9]*)\s*RPM', line, re.IGNORECASE)
+        if rpm_match:
+            try:
+                return float(rpm_match.group(1))
+            except ValueError:
+                pass
+        
+        # Also try simpler patterns like "1234.5 RPM"
+        rpm_match = re.search(r'([0-9]+\.?[0-9]*)\s*RPM', line, re.IGNORECASE)
+        if rpm_match:
+            try:
+                return float(rpm_match.group(1))
+            except ValueError:
+                pass
+        
+        return None
+    
+    def serial_reader_thread(self):
+        """Thread function to read serial data"""
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        
+        while self.running:
+            try:
+                if self.serial_conn and self.serial_conn.is_open:
+                    if self.serial_conn.in_waiting > 0:
+                        line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
+                        if line:
+                            # Parse RPM from the line
+                            rpm = self.parse_rpm_from_line(line)
+                            
+                            if rpm is not None:
+                                # Only log if we're in logging mode
+                                if self.logging and self.start_time is not None:
+                                    current_time = time.time()
+                                    elapsed_time_ms = int((current_time - self.start_time) * 1000)
+                                    
+                                    # Log to CSV
+                                    self.log_data(elapsed_time_ms, rpm)
+                                    
+                                    # Print to console
+                                    print(f"{elapsed_time_ms:6d}ms: {rpm:7.1f} RPM")
+                                else:
+                                    # Show current RPM even when not logging
+                                    print(f"Current: {rpm:7.1f} RPM (not logging)")
+                                
+                                consecutive_errors = 0
+                    
+                    time.sleep(0.01)  # Small delay to prevent CPU overload
+                    
+                else:
+                    print("✗ Serial connection lost")
+                    break
+                    
+            except serial.SerialException as e:
+                consecutive_errors += 1
+                print(f"✗ Serial error ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    print("✗ Too many serial errors. Stopping.")
+                    break
+                else:
+                    time.sleep(1)
+                    
+            except Exception as e:
+                consecutive_errors += 1
+                print(f"✗ Unexpected error ({consecutive_errors}/{max_consecutive_errors}): {e}")
+                if consecutive_errors >= max_consecutive_errors:
+                    break
+                time.sleep(1)
+    
+    def connect(self):
+        """Connect to Arduino"""
+        if not self.port:
+            print("🔍 Searching for Arduino...")
+            self.port = self.find_arduino_port()
+            
+        if not self.port:
+            print("✗ No Arduino found. Please specify port manually.")
+            return False
+        
+        try:
+            self.serial_conn = serial.Serial(
+                port=self.port,
+                baudrate=BAUD_RATE,
+                timeout=SERIAL_TIMEOUT
+            )
+            print(f"✓ Connected to Arduino on {self.port}")
+            
+            # Clear buffers and wait for Arduino to initialize
+            self.serial_conn.reset_input_buffer()
+            self.serial_conn.reset_output_buffer()
+            time.sleep(2)
+            
+            return True
+            
+        except serial.SerialException as e:
+            print(f"✗ Error connecting to {self.port}: {e}")
+            return False
+        except Exception as e:
+            print(f"✗ Unexpected connection error: {e}")
+            return False
+    
+    def start_monitoring(self):
+        """Start monitoring RPM (but not logging yet)"""
+        if not self.connect():
+            return False
+        
+        # Setup CSV file
+        if not self.setup_csv():
+            return False
+        
+        # Start serial reading thread
+        self.running = True
+        self.serial_thread = threading.Thread(target=self.serial_reader_thread)
+        self.serial_thread.daemon = True
+        self.serial_thread.start()
+        
+        print("✓ RPM monitoring started")
+        print("Commands:")
+        print("  'start' or 's' - Start recording data")
+        print("  'stop' or 'x'  - Stop recording data")
+        print("  'quit' or 'q'  - Exit program")
+        print()
+        
+        return True
+    
+    def start_recording(self):
+        """Start recording data to CSV"""
+        if not self.running:
+            print("✗ Not connected to Arduino")
+            return False
+        
+        if self.logging:
+            print("! Already recording")
+            return True
+        
+        self.start_time = time.time()
+        self.logging = True
+        print("🔴 RECORDING STARTED - Data logging to CSV")
+        return True
+    
+    def stop_recording(self):
+        """Stop recording data"""
+        if not self.logging:
+            print("! Not currently recording")
+            return
+        
+        self.logging = False
+        print("⏹️  RECORDING STOPPED")
+    
+    def stop_monitoring(self):
+        """Stop monitoring and close connections"""
+        print("\n🛑 Stopping monitoring...")
+        
+        self.logging = False
+        self.running = False
+        
+        # Wait for thread to finish
+        if hasattr(self, 'serial_thread') and self.serial_thread.is_alive():
+            self.serial_thread.join(timeout=2)
+        
+        # Close serial connection
+        if self.serial_conn and self.serial_conn.is_open:
+            try:
+                self.serial_conn.close()
+                print("✓ Serial connection closed")
+            except Exception as e:
+                print(f"✗ Error closing serial: {e}")
+        
+        # Close CSV file
+        self.close_csv()
+
+def list_serial_ports():
+    """List available serial ports"""
+    ports = serial.tools.list_ports.comports()
+    if not ports:
+        print("No serial ports found!")
+        return []
+    
+    print("Available serial ports:")
+    for i, port in enumerate(ports):
+        print(f"  {i}: {port.device} - {port.description}")
+    return ports
+
+def main():
+    print("=" * 50)
+    print("Boreasa Blower RPM Logger")
+    print("Simple RPM monitoring and CSV logging")
+    print("=" * 50)
+    
+    # Check for command line port argument
+    port = None
+    if len(sys.argv) > 1:
+        port = sys.argv[1]
+        print(f"Using specified port: {port}")
+    
+    # If no port specified, try auto-detection or manual selection
+    if not port:
+        logger = BoreasaRPMLogger()
+        auto_port = logger.find_arduino_port()
+        
+        if auto_port:
+            port = auto_port
+        else:
+            # Manual port selection
+            ports = list_serial_ports()
+            if not ports:
+                return
+            
+            try:
+                choice = input("\nEnter port number (or press Enter for auto-detect): ").strip()
+                if choice.isdigit():
+                    choice = int(choice)
+                    if 0 <= choice < len(ports):
+                        port = ports[choice].device
+                    else:
+                        print("Invalid choice!")
+                        return
+                elif not choice:
+                    print("No port selected!")
+                    return
+                else:
+                    port = choice  # Direct port name like "COM8"
+            except (ValueError, KeyboardInterrupt):
+                print("\nExiting...")
+                return
+    
+    # Initialize logger with selected port
+    logger = BoreasaRPMLogger(port)
+    
+    try:
+        if not logger.start_monitoring():
+            return
+        
+        # Interactive command loop
+        while logger.running:
+            try:
+                command = input("> ").strip().lower()
+                
+                if command in ['start', 's']:
+                    logger.start_recording()
+                elif command in ['stop', 'x']:
+                    logger.stop_recording()
+                elif command in ['quit', 'q', 'exit']:
+                    break
+                elif command == 'help':
+                    print("Commands:")
+                    print("  'start' or 's' - Start recording data")
+                    print("  'stop' or 'x'  - Stop recording data")
+                    print("  'quit' or 'q'  - Exit program")
+                elif command:
+                    print(f"Unknown command: {command}. Type 'help' for commands.")
+                    
+            except (KeyboardInterrupt, EOFError):
+                print("\nExiting...")
+                break
+                
+    except KeyboardInterrupt:
+        print("\nStopped by user")
+    finally:
+        logger.stop_monitoring()
+    
+    print("Goodbye!")
+
+if __name__ == "__main__":
+    main()
