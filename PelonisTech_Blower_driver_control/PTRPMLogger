@@ -1,0 +1,256 @@
+"""
+PWM Blower Logger - Windows Compatible
+Logs PWM-controlled BA4028H24B blower data to Excel automatically
+For use with ZS-X11F Driver and Arduino PWM control
+"""
+
+import serial
+import pandas as pd
+import time
+from datetime import datetime
+import threading
+import sys
+
+class PWMBlowerLogger:
+    def __init__(self):
+        self.data_list = []
+        self.running = True
+        self.recording = False
+        self.recording_start_time = 0
+        self.ser = None
+        
+    def connect_arduino(self, com_port='COM7'):
+        try:
+            self.ser = serial.Serial(com_port, 115200, timeout=1)
+            print(f"✓ Connected to Arduino on {com_port}")
+            time.sleep(2)
+            return True
+        except Exception as e:
+            print(f"✗ Connection failed: {e}")
+            return False
+    
+    def save_data(self):
+        if not self.data_list:
+            print("No data to save - recording was not started")
+            return
+            
+        try:
+            df = pd.DataFrame(self.data_list)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"pwm_blower_data_{timestamp}.xlsx"
+            
+            df.to_excel(filename, index=False)
+            print(f"💾 Saved {len(self.data_list)} records to: {filename}")
+            
+            # Show summary
+            if len(df) > 0:
+                print(f"📈 RPM Range: {df['Actual_RPM'].min():.0f} - {df['Actual_RPM'].max():.0f}")
+                print(f"⚡ PWM Range: {df['PWM_Value'].min():.0f} - {df['PWM_Value'].max():.0f}")
+                print(f"⏱️  Duration: {df['Timestamp_ms'].max()/1000:.1f} seconds")
+            
+            # Clear data after saving
+            self.data_list = []
+            
+        except Exception as e:
+            print(f"✗ Save error: {e}")
+    
+    def start_recording(self):
+        """Start recording data with timestamp reset"""
+        self.recording = True
+        self.recording_start_time = time.time() * 1000  # Current time in milliseconds
+        self.data_list = []  # Clear any existing data
+        print("🔴 RECORDING STARTED - Timestamp reset to 0ms")
+        
+    def stop_recording(self):
+        """Stop recording and auto-save"""
+        if not self.recording:
+            print("⚠️  Recording was not active")
+            return
+            
+        self.recording = False
+        print("⏹️  RECORDING STOPPED")
+        
+        if self.data_list:
+            self.save_data()
+        else:
+            print("No data recorded during this session")
+    
+    def input_thread(self):
+        """Handle user commands in separate thread"""
+        while self.running:
+            try:
+                command = input().strip()
+                
+                if command.lower() == 'quit' or command.lower() == 'exit':
+                    print("👋 Goodbye! (No data saved)")
+                    self.running = False
+                    break
+                elif command.lower() == 'start':
+                    self.start_recording()
+                elif command.lower() == 'stop':
+                    self.stop_recording()
+                elif command.lower() == 'save':
+                    self.save_data()
+                elif command.lower().startswith('s') and len(command) > 1:
+                    # RPM command like s25000
+                    if self.ser:
+                        self.ser.write(f"{command}\n".encode())
+                        print(f"→ Sent: {command}")
+                elif command.lower() == 'off':
+                    if self.ser:
+                        self.ser.write("off\n".encode())
+                        print("→ Sent: off (motor stop)")
+                elif command.lower() == 'status':
+                    if self.ser:
+                        self.ser.write("status\n".encode())
+                        print("→ Sent: status")
+                elif command.lower() == 'help':
+                    print("\n=== PWM BLOWER COMMANDS ===")
+                    print("Recording Control:")
+                    print("  start    - Start recording (resets timestamp to 0ms)")
+                    print("  stop     - Stop recording and auto-save to Excel")
+                    print("Motor Control:")
+                    print("  s25000   - Set target RPM")
+                    print("  off      - Turn motor off")
+                    print("  status   - Get motor status")
+                    print("System:")
+                    print("  save     - Manual save (if recording)")
+                    print("  exit     - Exit without saving")
+                    print("============================")
+                else:
+                    print("Unknown command. Type 'help' for commands.")
+            except:
+                break
+    
+    def run(self, com_port='COM7'):
+        if not self.connect_arduino(com_port):
+            input("Press Enter to exit...")
+            return
+        
+        print("\n🌀 PWM Blower Logger Ready")
+        print("=" * 40)
+        print("📋 Commands: start, stop, s25000, off, status, exit")
+        print("💡 Type 'start' to begin recording, 'stop' to save Excel file")
+        print("⚠️  Data is only saved when recording is active!")
+        print("🔧 Motor: BA4028H24B with ZS-X11F Driver")
+        print()
+        
+        # Start input thread
+        input_thread = threading.Thread(target=self.input_thread)
+        input_thread.daemon = True
+        input_thread.start()
+        
+        try:
+            while self.running:
+                if self.ser.in_waiting > 0:
+                    try:
+                        line = self.ser.readline().decode('utf-8').strip()
+                        
+                        # Handle formatted Arduino output like: "LIVE | RPM: 25000 | Target: 25000 | PWM: 180 | (s<rpm> to set)"
+                        if ("LIVE" in line and "RPM:" in line and "Target:" in line and "PWM:" in line):
+                            # Parse the formatted line from Arduino
+                            try:
+                                # Extract values using string parsing
+                                rpm_start = line.find("RPM: ") + 5
+                                rpm_end = line.find(" |", rpm_start)
+                                actual_rpm = float(line[rpm_start:rpm_end])
+                                
+                                target_start = line.find("Target: ") + 8
+                                target_end = line.find(" |", target_start)
+                                target_rpm = int(line[target_start:target_end])
+                                
+                                pwm_start = line.find("PWM: ") + 5
+                                pwm_end = line.find(" |", pwm_start)
+                                pwm_value = int(line[pwm_start:pwm_end])
+                                
+                                if self.recording:
+                                    # Record data when recording is active
+                                    current_time_ms = time.time() * 1000
+                                    relative_timestamp = int(current_time_ms - self.recording_start_time)
+                                    
+                                    data_entry = {
+                                        'DateTime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                        'Timestamp_ms': relative_timestamp,
+                                        'Target_RPM': target_rpm,
+                                        'Actual_RPM': actual_rpm,
+                                        'PWM_Value': pwm_value,
+                                        'Status': 'OK'
+                                    }
+                                    self.data_list.append(data_entry)
+                                    
+                                    print(f"🔴 RECORDING | Time: {relative_timestamp/1000:.1f}s | "
+                                          f"RPM: {actual_rpm:.0f} | "
+                                          f"Target: {target_rpm} | "
+                                          f"PWM: {pwm_value}")
+                                else:
+                                    # Show live data but don't record
+                                    print(f"⚪ LIVE | RPM: {actual_rpm:.0f} | "
+                                          f"Target: {target_rpm} | "
+                                          f"PWM: {pwm_value} | "
+                                          f"(Type 'start' to record)")
+                                          
+                            except Exception as parse_error:
+                                print(f"Parse error: {parse_error}")
+                                # Fallback: just show the raw line
+                                print(f"Raw: {line}")
+                        
+                        elif line.startswith('STATUS,'):
+                            # Parse: STATUS,target_rpm,actual_rpm,pwm_value,status
+                            parts = line.split(',')
+                            if len(parts) >= 5:
+                                target_rpm = int(parts[1])
+                                actual_rpm = float(parts[2])
+                                pwm_value = int(parts[3])
+                                status = parts[4]
+                                
+                                print(f"📊 STATUS | Target: {target_rpm} | "
+                                      f"Actual: {actual_rpm:.0f} | "
+                                      f"PWM: {pwm_value} | "
+                                      f"Status: {status}")
+                        
+                        elif line.startswith('ACK,'):
+                            print(f"✓ {line.replace('ACK,', '')}")
+                        elif line.startswith('INFO,'):
+                            print(f"ℹ️ {line.replace('INFO,', '')}")
+                        elif line == 'READY':
+                            print("✓ Arduino ready!")
+                        elif line.strip() != "":
+                            # Show any other non-empty lines from Arduino
+                            print(f"Arduino: {line}")
+                    
+                    except Exception as e:
+                        print(f"Parse error: {e}")
+                        if 'line' in locals():
+                            print(f"Raw line: {line}")
+                
+                time.sleep(0.1)
+        
+        except KeyboardInterrupt:
+            print("\n🛑 Ctrl+C pressed")
+        
+        finally:
+            self.running = False
+            # NO auto-save on exit - user must use 'stop' command to save
+            
+            if self.ser:
+                self.ser.close()
+            print("Disconnected")
+
+def main():
+    """Main function with COM port selection"""
+    print("PWM Blower Logger")
+    print("For BA4028H24B Blower with ZS-X11F Driver")
+    
+    # Ask for COM port
+    com_port = input("Enter COM port (default COM7): ").strip().upper()
+    if not com_port:
+        com_port = "COM7"
+    elif not com_port.startswith("COM"):
+        com_port = f"COM{com_port}"
+    
+    logger = PWMBlowerLogger()
+    logger.run(com_port)
+    input("Press Enter to exit...")
+
+if __name__ == "__main__":
+    main()
