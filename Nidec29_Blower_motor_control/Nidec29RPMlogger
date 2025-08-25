@@ -1,0 +1,272 @@
+"""
+Simple Arduino Logger - Windows Compatible
+Logs Arduino data to Excel automatically
+"""
+
+import serial
+import pandas as pd
+import time
+from datetime import datetime
+import threading
+import sys
+
+class SimpleLogger:
+    def __init__(self):
+        self.data_list = []
+        self.running = True
+        self.recording = False
+        self.recording_start_time = 0
+        self.ser = None
+        
+    def connect_arduino(self):
+        try:
+            self.ser = serial.Serial('COM7', 115200, timeout=1)
+            print("✓ Connected to Arduino on COM7")
+            time.sleep(2)
+            return True
+        except Exception as e:
+            print(f"✗ Connection failed: {e}")
+            return False
+    
+    def save_data(self):
+        if not self.data_list:
+            print("No data to save - recording was not started")
+            return
+            
+        try:
+            df = pd.DataFrame(self.data_list)
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"blower_data_{timestamp}.xlsx"
+            
+            df.to_excel(filename, index=False)
+            print(f"💾 Saved {len(self.data_list)} records to: {filename}")
+            
+            # Show summary
+            if len(df) > 0:
+                print(f"📈 RPM Range: {df['Actual_RPM'].min():.0f} - {df['Actual_RPM'].max():.0f}")
+                print(f"⚡ Voltage Range: {df['Target_CNT_V'].min():.2f}V - {df['Target_CNT_V'].max():.2f}V")
+                print(f"⏱️  Duration: {df['Timestamp_ms'].max()/1000:.1f} seconds")
+            
+            # Clear data after saving
+            self.data_list = []
+            
+        except Exception as e:
+            print(f"✗ Save error: {e}")
+    
+    def start_recording(self):
+        """Start recording data with timestamp reset"""
+        self.recording = True
+        self.recording_start_time = time.time() * 1000  # Current time in milliseconds
+        self.data_list = []  # Clear any existing data
+        print("🔴 RECORDING STARTED - Timestamp reset to 0ms")
+        
+    def stop_recording(self):
+        """Stop recording and auto-save"""
+        if not self.recording:
+            print("⚠️  Recording was not active")
+            return
+            
+        self.recording = False
+        print("⏹️  RECORDING STOPPED")
+        
+        if self.data_list:
+            self.save_data()
+        else:
+            print("No data recorded during this session")
+    
+    def input_thread(self):
+        """Handle user commands in separate thread"""
+        while self.running:
+            try:
+                command = input().strip()
+                
+                if command.lower() == 'quit' or command.lower() == 'exit':
+                    print("👋 Goodbye! (No data saved)")
+                    self.running = False
+                    break
+                elif command.lower() == 'start':
+                    self.start_recording()
+                elif command.lower() == 'stop':
+                    self.stop_recording()
+                elif command.lower() == 'save':
+                    self.save_data()
+                elif command.lower().startswith(('s', 'v')) or command.lower() in ['brake_on', 'brake_off']:
+                    if self.ser:
+                        self.ser.write(f"{command}\n".encode())
+                        print(f"→ Sent: {command}")
+                elif command.lower() == 'stop_motor':
+                    if self.ser:
+                        self.ser.write("stop\n".encode())
+                        print("→ Sent: stop (motor stopped, recording continues)")
+                elif command.lower() == 'help':
+                    print("\n=== COMMANDS ===")
+                    print("Recording Control:")
+                    print("  start  - Start recording (resets timestamp to 0ms)")
+                    print("  stop   - Stop recording and auto-save to Excel")
+                    print("Motor Control:")
+                    print("  s25000 - Set RPM")
+                    print("  v2.5   - Set voltage") 
+                    print("  brake_on/brake_off - Control brake")
+                    print("  stop_motor - Stop motor (NOT stop recording)")
+                    print("System:")
+                    print("  save   - Manual save (if recording)")
+                    print("  exit   - Exit without saving")
+                    print("==================")
+                else:
+                    print("Unknown command. Type 'help' for commands.")
+            except:
+                break
+    
+    def run(self):
+        if not self.connect_arduino():
+            input("Press Enter to exit...")
+            return
+        
+        print("\n🚁 Arduino Logger Ready")
+        print("=" * 40)
+        print("📋 Commands: start, stop, s25000, v2.5, brake_on, brake_off, stop_motor, exit")
+        print("💡 Type 'start' to begin recording, 'stop' to save Excel file")
+        print("⚠️  Data is only saved when recording is active!")
+        print()
+        
+        # Start input thread
+        input_thread = threading.Thread(target=self.input_thread)
+        input_thread.daemon = True
+        input_thread.start()
+        
+        try:
+            while self.running:
+                if self.ser.in_waiting > 0:
+                    try:
+                        line = self.ser.readline().decode('utf-8').strip()
+                        
+                        # Handle formatted Arduino output like: "●LIVE | RPM: 25000 | Target: 25000 | CNT: 3.50V | Brake: OFF | Status: OK | (Type 'start' to record)"
+                        if ("LIVE" in line and "RPM:" in line and "Target:" in line and "CNT:" in line):
+                            # Parse the formatted line from Arduino
+                            try:
+                                is_recording_display = "●LIVE" in line
+                                
+                                # Extract values using string parsing
+                                rpm_start = line.find("RPM: ") + 5
+                                rpm_end = line.find(" |", rpm_start)
+                                actual_rpm = float(line[rpm_start:rpm_end])
+                                
+                                target_start = line.find("Target: ") + 8
+                                target_end = line.find(" |", target_start)
+                                target_rpm = int(line[target_start:target_end])
+                                
+                                cnt_start = line.find("CNT: ") + 5
+                                cnt_end = line.find("V |", cnt_start)
+                                cnt_voltage = float(line[cnt_start:cnt_end])
+                                
+                                brake_start = line.find("Brake: ") + 7
+                                brake_end = line.find(" |", brake_start)
+                                brake_status = line[brake_start:brake_end]
+                                
+                                status_start = line.find("Status: ") + 8
+                                status_end = line.find(" |", status_start)
+                                error_status = line[status_start:status_end]
+                                
+                                if self.recording:
+                                    # Record data when recording is active
+                                    current_time_ms = time.time() * 1000
+                                    relative_timestamp = int(current_time_ms - self.recording_start_time)
+                                    
+                                    data_entry = {
+                                        'DateTime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                        'Timestamp_ms': relative_timestamp,
+                                        'Target_RPM': target_rpm,
+                                        'Actual_RPM': actual_rpm,
+                                        'Target_CNT_V': cnt_voltage,
+                                        'Brake_Status': brake_status,
+                                        'Error_Status': error_status
+                                    }
+                                    self.data_list.append(data_entry)
+                                    
+                                    print(f"🔴 RECORDING | Time: {relative_timestamp/1000:.1f}s | "
+                                          f"RPM: {actual_rpm:.0f} | "
+                                          f"Target: {target_rpm} | "
+                                          f"CNT: {cnt_voltage:.2f}V | "
+                                          f"Brake: {brake_status} | "
+                                          f"Status: {error_status}")
+                                else:
+                                    # Show live data but don't record
+                                    print(f"⚪ LIVE | RPM: {actual_rpm:.0f} | "
+                                          f"Target: {target_rpm} | "
+                                          f"CNT: {cnt_voltage:.2f}V | "
+                                          f"Brake: {brake_status} | "
+                                          f"Status: {error_status} | "
+                                          f"(Type 'start' to record)")
+                                          
+                            except Exception as parse_error:
+                                print(f"Parse error: {parse_error}")
+                                # Fallback: just show the raw line
+                                print(f"Raw: {line}")
+                        
+                        elif line.startswith('DATA,'):
+                            # Parse: DATA,timestamp,target_rpm,actual_rpm,target_v,brake,error
+                            parts = line.split(',')
+                            if len(parts) == 7 and self.recording:
+                                # Calculate relative timestamp from recording start
+                                current_time_ms = time.time() * 1000
+                                relative_timestamp = int(current_time_ms - self.recording_start_time)
+                                
+                                data_entry = {
+                                    'DateTime': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                                    'Timestamp_ms': relative_timestamp,
+                                    'Target_RPM': int(parts[2]),
+                                    'Actual_RPM': float(parts[3]),
+                                    'Target_CNT_V': float(parts[4]),
+                                    'Brake_Status': 'ON' if parts[5] == '1' else 'OFF',
+                                    'Error_Status': 'ERROR' if parts[6] == '1' else 'OK'
+                                }
+                                self.data_list.append(data_entry)
+                                
+                                print(f"� RECORDING | Time: {relative_timestamp/1000:.1f}s | "
+                                      f"RPM: {data_entry['Actual_RPM']:.0f} | "
+                                      f"Target: {data_entry['Target_RPM']} | "
+                                      f"CNT: {data_entry['Target_CNT_V']:.2f}V | "
+                                      f"Brake: {data_entry['Brake_Status']} | "
+                                      f"Status: {data_entry['Error_Status']}")
+                            
+                            elif len(parts) == 7 and not self.recording:
+                                # Show live data but don't record
+                                print(f"⚪ LIVE | RPM: {float(parts[3]):.0f} | "
+                                      f"Target: {int(parts[2])} | "
+                                      f"CNT: {float(parts[4]):.2f}V | "
+                                      f"Brake: {'ON' if parts[5] == '1' else 'OFF'} | "
+                                      f"Status: {'ERROR' if parts[6] == '1' else 'OK'} | "
+                                      f"(Type 'start' to record)")
+                        
+                        elif line.startswith('ACK,'):
+                            print(f"✓ {line.replace('ACK,', '')}")
+                        elif line.startswith('ERROR,'):
+                            print(f"🚨 {line}")
+                        elif line == 'READY':
+                            print("✓ Arduino ready!")
+                        elif line.strip() != "":
+                            # Show any other non-empty lines from Arduino (including the formatted LIVE data)
+                            print(f"Arduino: {line}")
+                    
+                    except Exception as e:
+                        print(f"Parse error: {e}")
+                        if 'line' in locals():
+                            print(f"Raw line: {line}")
+                
+                time.sleep(0.1)
+        
+        except KeyboardInterrupt:
+            print("\n🛑 Ctrl+C pressed")
+        
+        finally:
+            self.running = False
+            # NO auto-save on exit - user must use 'stop' command to save
+            
+            if self.ser:
+                self.ser.close()
+            print("Disconnected")
+
+if __name__ == "__main__":
+    logger = SimpleLogger()
+    logger.run()
+    input("Press Enter to exit...")
