@@ -1,0 +1,132 @@
+/*
+ * BA4028H24B Blower with ZS-X11F Driver PWM Control
+ * This code uses PWM for speed control and reads the tachometer signal.
+ * It includes a software ramp for safe speed changes.
+ *
+ * WIRING:
+ * - Arduino Pin 9 (PWM) --> Driver "Input 0-5V PWM" (pin 6)
+ * - Arduino Pin 2 (Interrupt) --> Driver "Speed pulse output SC"
+ * - Arduino GND --> Driver "Ground GND" (between DIR and PWM input)
+ 
+*/
+#include <Arduino.h>
+
+// --- Pin Definitions ---
+const int PWM_PIN = 9;  // Must be a PWM-capable pin (e.g., 3, 5, 6, 9, 10, 11)
+const int FG_PIN = 2;   // Tachometer (Frequency Generator) pin, must be interrupt-capable
+
+// --- Blower & Driver Constants ---
+const int MIN_RPM = 0;  // Minimum stable RPM for this blower
+const int MAX_RPM = 48000; // Maximum RPM for this blower
+// IMPORTANT: You MUST calibrate this value! It's the number of pulses the SC pin
+// sends for one full revolution of the motor. Start with 6.0 as a guess.
+const float PULSES_PER_REV = 1;
+
+// --- Tachometer Variables ---
+volatile unsigned long fgPulseCount = 0;
+unsigned long lastRpmTime = 0;
+float currentRpm = 0;
+
+// --- Control Variables ---
+int targetRpm = 0;
+int currentPwmValue = 0;
+
+void countFgPulse() {
+  fgPulseCount++;
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  pinMode(PWM_PIN, OUTPUT);
+  pinMode(FG_PIN, INPUT);
+
+  // Ensure motor is off at start
+  analogWrite(PWM_PIN, 0);
+
+  attachInterrupt(digitalPinToInterrupt(FG_PIN), countFgPulse, RISING);
+
+  Serial.println("READY"); // Signal to any listening script
+}
+
+void loop() {
+  handleSerialCommands();
+
+  // Update and print RPM data every 900ms
+  if (millis() - lastRpmTime >= 900) {
+    // Calculate RPM
+    noInterrupts();
+    unsigned long pulses = fgPulseCount;
+    fgPulseCount = 0;
+    interrupts();
+
+    // RPM = (pulses / pulses_per_rev) * seconds_per_minute
+    // Adjust for 900ms sampling period: (pulses / 0.9 seconds) * 60
+    currentRpm = (pulses / PULSES_PER_REV) * (60.0 / 0.9);
+    
+    // Print status
+    Serial.print("LIVE | RPM: ");
+    Serial.print((int)currentRpm);
+    Serial.print(" | Target: ");
+    Serial.print(targetRpm);
+    Serial.print(" | PWM: ");
+    Serial.print(currentPwmValue);
+    Serial.print(" | (s<rpm> to set)");
+    Serial.println();
+    
+    lastRpmTime = millis();
+  }
+}
+
+// Safely ramps the motor speed to a new target RPM
+void rampSpeed(int newRpm) {
+  targetRpm = constrain(newRpm, 0, MAX_RPM);
+
+  int newPwmValue;
+  if (targetRpm < MIN_RPM) {
+    newPwmValue = 0;
+  } else {
+    // Map the RPM range (0-48000) to the PWM duty cycle range (e.g., 0-255)
+    // We start PWM at 60 to ensure the motor has enough power to start spinning. Calibrate if needed.
+    newPwmValue = map(targetRpm, MIN_RPM, MAX_RPM, 0, 255);
+  }
+
+  // Ramp up or down smoothly
+  int step = (newPwmValue > currentPwmValue) ? 1 : -1;
+  
+  while (currentPwmValue != newPwmValue) {
+    currentPwmValue += step;
+    analogWrite(PWM_PIN, currentPwmValue);
+    delay(40); // Small delay to control ramp speed. Adjust as needed.
+  }
+  Serial.println("ACK,RAMP_COMPLETE");
+}
+
+
+void handleSerialCommands() {
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+
+    if (command.startsWith("s")) {
+      int rpm = command.substring(1).toInt();
+      Serial.print("INFO,RAMPING_TO_");
+      Serial.println(rpm);
+      rampSpeed(rpm);
+    } 
+    else if (command.equalsIgnoreCase("off")) {
+      Serial.println("INFO,RAMPING_DOWN");
+      rampSpeed(0);
+    }
+    else if (command.equalsIgnoreCase("status")) {
+      Serial.print("STATUS,");
+      Serial.print(targetRpm);
+      Serial.print(",");
+      Serial.print(currentRpm, 0);
+      Serial.print(",");
+      Serial.print(currentPwmValue);
+      Serial.println(",OK");
+    }
+  }
+} 
